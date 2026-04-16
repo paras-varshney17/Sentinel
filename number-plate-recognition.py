@@ -20,12 +20,11 @@ class ANPR:
             verbose=False
         )
 
-        # Cache
-        self.last_text = ""
-        self.last_time = 0
-        self.cooldown = 5  # seconds
+        # 🔥 Unique filtering (DB spam control)
+        self.plate_history = {}
+        self.unique_window = 10  # seconds
 
-        # 🔥 Neon PostgreSQL Connection Pool
+        # 🔥 DB (replace with your real credentials)
         NEON_DB_URL = "postgresql://neondb_owner:npg_T8bhfCs5tZeI@ep-red-mode-amjsx3r0.c-5.us-east-1.aws.neon.tech/neondb?sslmode=require"
 
         self.db_pool = psycopg2.pool.SimpleConnectionPool(
@@ -34,28 +33,25 @@ class ANPR:
             dsn=NEON_DB_URL
         )
 
-    # ✅ Get connection safely
     def get_conn(self):
         return self.db_pool.getconn()
 
     def release_conn(self, conn):
         self.db_pool.putconn(conn)
 
-    # ✅ Save to PostgreSQL
-    def save_to_db(self, plate_text, camera_id="CAM_1"):
+    def save_to_db(self, plate_text):
         conn = None
         try:
             conn = self.get_conn()
             cursor = conn.cursor()
 
-            query = """
-            INSERT INTO plates (plate_text, camera_id)
-            VALUES (%s, %s)
-            """
-            cursor.execute(query, (plate_text, camera_id))
+            cursor.execute(
+                "INSERT INTO plates (plate_text) VALUES (%s)",
+                (plate_text,)
+            )
             conn.commit()
 
-            print(f"💾 Saved to DB: {plate_text}")
+            print(f"💾 Saved: {plate_text}")
 
         except Exception as e:
             print("DB Error:", e)
@@ -64,18 +60,21 @@ class ANPR:
             if conn:
                 self.release_conn(conn)
 
+    def normalize_text(self, text):
+        text = text.replace(" ", "").upper()
+        text = text.replace("O", "0").replace("I", "1")
+        return text
+
     def detect_plates(self, frame):
         results = self.model.predict(frame, conf=0.4, verbose=False)
-
         if results and results[0].boxes is not None:
             return results[0].boxes.xyxy.cpu().numpy()
         return []
 
-    def preprocess_roi(self, roi):
+    def preprocess(self, roi):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        gray = cv2.bilateralFilter(gray, 11, 17, 17)
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-        return thresh
+        gray = cv2.equalizeHist(gray)
+        return gray
 
     def extract_text(self, frame, bbox):
         x1, y1, x2, y2 = map(int, bbox)
@@ -89,77 +88,90 @@ class ANPR:
         if roi.size == 0:
             return ""
 
-        roi = cv2.resize(roi, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-        processed = self.preprocess_roi(roi)
+        # resize for better OCR
+        roi = cv2.resize(roi, None, fx=2, fy=2)
 
-        text = self.reader.readtext(processed, detail=0)
-        return " ".join(text).strip()
+        processed = self.preprocess(roi)
+        processed = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
 
-    def infer_ipcam(self, ip_url, display=True, duration=None):
-        cap = cv2.VideoCapture(ip_url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        variants = [roi, processed]
+
+        best_text = ""
+        best_conf = 0
+
+        for var in variants:
+            results = self.reader.readtext(
+                var,
+                detail=1,
+                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            )
+
+            for (_, txt, conf) in results:
+                if conf > best_conf:
+                    best_conf = conf
+                    best_text = txt
+
+        return best_text.strip()
+
+    def infer_ipcam(self, ip_url):
+        cap = cv2.VideoCapture(ip_url)
 
         if not cap.isOpened():
-            raise ValueError("❌ Cannot open IP camera stream")
+            raise ValueError("❌ Camera not opened")
 
-        frame_count = 0
-        skip_frames = 4
-        start_time = time.time()
-
-        print("🚀 Running ANPR with PostgreSQL... Press 'q' to quit")
+        print("🚀 ANPR LIVE RUNNING...")
 
         while True:
-            if duration and (time.time() - start_time > duration):
-                print("⏹ Time limit reached")
+            ret, frame = cap.read()
+
+            # 🔥 FIX: no fake frames
+            if not ret or frame is None:
+                print("⚠️ Camera disconnected")
                 break
 
-            ret, frame = cap.read()
-            if not ret:
-                continue
-
-            cap.grab()
-            frame = cv2.resize(frame, (640, 480))
-
-            frame_count += 1
-            if frame_count % skip_frames != 0:
-                continue
+            frame = cv2.resize(frame, (960, 720))
 
             boxes = self.detect_plates(frame)
             ann = Annotator(frame, line_width=2)
 
             for bbox in boxes:
-                current_time = time.time()
+                text = self.extract_text(frame, bbox)
 
-                if current_time - self.last_time > self.cooldown:
-                    text = self.extract_text(frame, bbox)
-
-                    if len(text) >= 6 and text != self.last_text:
-                        self.last_text = text
-                        self.last_time = current_time
-
-                        # ✅ Terminal output
-                        print(f"[{time.strftime('%H:%M:%S')}] Plate: {text}")
-
-                        # ✅ Save to PostgreSQL
-                        self.save_to_db(text)
-
-                else:
-                    text = self.last_text
-
+                # 🔥 Always display live text (NO FREEZE)
                 ann.box_label(bbox, label=text, color=colors(17, True))
 
-            if display:
-                cv2.imshow("ANPR PostgreSQL", frame)
+                # 🔥 DB logic separate from display
+                if len(text) >= 6:
+                    norm_text = self.normalize_text(text)
+                    current_time = time.time()
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+                    last_seen = self.plate_history.get(norm_text, 0)
+
+                    if current_time - last_seen > self.unique_window:
+                        self.plate_history[norm_text] = current_time
+
+                        print(f"[{time.strftime('%H:%M:%S')}] Plate: {norm_text}")
+                        self.save_to_db(norm_text)
+
+            # clean old entries
+            self.plate_history = {
+                k: v for k, v in self.plate_history.items()
+                if time.time() - v < 60
+            }
+
+            try:
+                cv2.imshow("ANPR LIVE", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+            except:
+                pass
 
         cap.release()
         cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    ip_camera_url = "http://10.68.174.129:8080/video"
+    ip_camera_url = "http://172.20.50.202:8080/video"
 
     anpr = ANPR("anpr_best.pt")
-    anpr.infer_ipcam(ip_camera_url, display=True, duration=None)
+    anpr.infer_ipcam(ip_camera_url)
